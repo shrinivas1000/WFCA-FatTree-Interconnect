@@ -1,5 +1,5 @@
-*~
-\#*#
-._*
-.Apple*
+obj/
+bin/
+*.o
+*.d
 .DS_Store

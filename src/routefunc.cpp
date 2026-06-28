@@ -39,6 +39,7 @@
 #include <map>
 #include <cstdlib>
 #include <cassert>
+#include <vector>
 
 #include "booksim.hpp"
 #include "routefunc.hpp"
@@ -1911,8 +1912,118 @@ void chaos_mesh( const Router *r, const Flit *f,
     outputs->AddRange( 2*gN, 0, 0 ); 
   }
 }
+int int_pow(int base, int exp) {
+  int result = 1;
+  for (int i = 0; i < exp; i++) {
+    result *= base;
+  }
+  return result;
+}
 
-//=============================================================
+double GetCongestionWeight(const Router *r, int port) {
+  if (!r) return 1.0;
+  int used = r->GetUsedCredit(port);
+  double occupancy = (double)used / 4.0;
+  if (occupancy <= 0.0) return 0.1;
+  if (occupancy <= 0.5) return 0.2;
+  return 0.4;
+}
+
+void wfca_routing(const Router *r, const Flit *f, int in_channel, 
+                  OutputSet *outputs, bool inject) {
+  outputs->Clear();
+
+  // 1. INJECTION: Let BookSim handle the Read/Write VCs naturally
+  if (inject) {
+    outputs->AddRange(-1, 0, gNumVCs - 1);
+    return;
+  }
+
+  if (!r || !f) return;
+
+  int cur_id = r->GetID();
+  int dst_id = f->dest;
+  int k = gK; 
+
+  // 2. EJECTION
+  if (cur_id == dst_id) {
+    outputs->AddRange(4, 0, gNumVCs - 1); 
+    return;
+  }
+
+  int cur_x = cur_id % k;
+  int cur_y = cur_id / k;
+  int dst_x = dst_id % k;
+  int dst_y = dst_id / k;
+
+  const int EAST = 0, WEST = 1, NORTH = 2, SOUTH = 3;
+  int x_dir = (dst_x > cur_x) ? EAST : ((dst_x < cur_x) ? WEST : -1);
+  int y_dir = (dst_y > cur_y) ? NORTH : ((dst_y < cur_y) ? SOUTH : -1);
+
+  int final_port = 4; // Failsafe
+
+  // --- 3. WEST-FIRST DEADLOCK-FREE ADAPTIVE LOGIC ---
+  if (x_dir == WEST) {
+    // RULE: If you must go West, do it immediately. (Strict XY for Westbound)
+    final_port = WEST;
+  } 
+  else if (x_dir == EAST && y_dir != -1) {
+    // RULE: If going East and (North/South), adaptively dodge congestion!
+    double w_x = GetCongestionWeight(r, EAST);
+    double w_y = GetCongestionWeight(r, y_dir);
+    
+    // Pick the path with the lowest traffic weight
+    final_port = (w_y < w_x) ? y_dir : EAST;
+  } 
+  else {
+    // Only one direction left to go
+    final_port = (x_dir != -1) ? x_dir : y_dir;
+  }
+
+  // Add the single chosen port, retaining original VC privileges
+  outputs->AddRange(final_port, 0, gNumVCs - 1);
+}
+
+void wfca_fattree(const Router *r, const Flit *f, int in_channel, OutputSet *outputs, bool inject) {
+  // 1. THE TROJAN HORSE: Let BookSim map the strict downward physical wires
+  tRoutingFunction native_nca = gRoutingFunctionMap["nca_fattree"];
+  native_nca(r, f, in_channel, outputs, inject);
+
+  if (inject) return;
+
+  const set<OutputSet::sSetElement> & os = outputs->GetSet();
+  if (os.empty()) return;
+
+  int out_port = os.begin()->output_port;
+  int vc_start = os.begin()->vc_start;
+  int vc_end = os.begin()->vc_end;
+
+  // 2. THE HIJACK: Upward links (ports >= gK)
+  if (out_port >= gK) {
+    // --- Power-of-Two Choices (P2C) ---
+    // RandomInt(max) in BookSim returns an integer from 0 to max inclusive.
+    // For a k=4 Fat-Tree, gK is 4. Upward ports are 4, 5, 6, 7.
+    
+    int port_a = gK + RandomInt(gK - 1);
+    int port_b = gK + RandomInt(gK - 1);
+    
+    // Ensure the two randomly selected paths are distinct
+    while (port_a == port_b) {
+      port_b = gK + RandomInt(gK - 1);
+    }
+
+    // Read the exact credit counters for the two candidate ports
+    double weight_a = GetCongestionWeight(r, port_a);
+    double weight_b = GetCongestionWeight(r, port_b);
+
+    // Hardware Comparator: Route to the less congested of the two paths
+    int best_up_port = (weight_a <= weight_b) ? port_a : port_b;
+
+    // Wipe BookSim's blind choice and inject the P2C port
+    outputs->Clear();
+    outputs->AddRange(best_up_port, vc_start, vc_end);
+  }
+}
 
 void InitializeRoutingMap( const Configuration & config )
 {
@@ -1955,6 +2066,8 @@ void InitializeRoutingMap( const Configuration & config )
     gWriteReplyEndVC = gNumVCs - 1;
   }
 
+
+
   /* Register routing functions here */
 
   // ===================================================
@@ -1996,4 +2109,7 @@ void InitializeRoutingMap( const Configuration & config )
 
   gRoutingFunctionMap["chaos_mesh"]  = &chaos_mesh;
   gRoutingFunctionMap["chaos_torus"] = &chaos_torus;
+
+  gRoutingFunctionMap["wfca_mesh"] = &wfca_routing;
+  gRoutingFunctionMap["wfca_fattree"] = &wfca_fattree;
 }
